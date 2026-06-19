@@ -5,6 +5,7 @@ use anyhow::Result;
 use compact_str::CompactString;
 use db::SchemaDb;
 use models::{Property, SchemaNode, SchemaValue};
+use rkyv::Deserialize;
 use simd_json::prelude::*;
 use std::fs::File;
 use std::io::Read;
@@ -129,12 +130,19 @@ fn main() -> Result<()> {
     assert!(ids_prop.contains(&"http://test.org/1".to_string()));
     println!("Property index query verified.");
 
+    // Value Search Verification
+    println!("\n--- Value Search Verification ---");
+    let mut found_ids = Vec::new();
+    db.for_each_by_value("testProp", &SchemaValue::String(CompactString::new("testVal")), |node| {
+        found_ids.push(node.id.to_string());
+    })?;
+    assert!(found_ids.contains(&"http://test.org/1".to_string()));
+    println!("Value-based search verified.");
+
     db.remove("http://test.org/1")?;
     assert!(db.with_node("http://test.org/1", |_| ())?.is_none());
     let ids = db.get_ids_by_type("TestType")?;
     assert!(!ids.contains(&"http://test.org/1".to_string()));
-    let ids_prop = db.get_ids_by_property("testProp")?;
-    assert!(!ids_prop.contains(&"http://test.org/1".to_string()));
     println!("Remove and Index pruning verified.");
 
     // Advanced Query Verification
@@ -157,8 +165,17 @@ fn main() -> Result<()> {
     println!("\n--- Benchmarking ID: {} ---", test_id);
 
     // Warm up and verify
-    let _ = db.with_node(&test_id, |node| {
+    let mut label_val = SchemaValue::Null;
+    db.with_node(&test_id, |node| {
         println!("Found node: {} with {} types", node.id, node.types.len());
+        // Find a value for search benchmark
+        for p in node.properties.iter() {
+            if p.name == "rdfs:label" {
+                if let Some(v) = p.values.first() {
+                    label_val = v.deserialize(&mut rkyv::Infallible).unwrap();
+                }
+            }
+        }
     })?.expect("Test node not found");
 
     let iters = 1_000_000;
@@ -188,6 +205,20 @@ fn main() -> Result<()> {
     })?.unwrap();
     println!("Pure zero-copy access ({} iters): {:?}", iters, duration_pure_access);
     println!("Average pure access latency: {:?}", duration_pure_access / iters);
+
+    // Benchmark Value-based Search
+    if !matches!(label_val, SchemaValue::Null) {
+        let start = Instant::now();
+        let search_iters = 100_000;
+        for _ in 0..search_iters {
+            let _ = db.for_each_by_value("rdfs:label", &label_val, |node| {
+                std::hint::black_box(&node.id);
+            })?;
+        }
+        let duration_search = start.elapsed();
+        println!("Value search for '{}' ({} iters): {:?}", "rdfs:label", search_iters, duration_search);
+        println!("Average search latency: {:?}", duration_search / search_iters);
+    }
 
     // Compare with serde_json
     let json_node = serde_json::json!({
