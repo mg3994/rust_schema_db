@@ -78,10 +78,11 @@ fn main() -> Result<()> {
                     continue;
                 }
 
-                let schema_vals = convert_simd_value(val);
+                let (values, refs) = convert_simd_value(val);
                 node.properties.push(Property {
                     name: CompactString::new(key.as_ref()),
-                    values: schema_vals,
+                    values,
+                    references: refs,
                 });
             }
             schema_nodes.push(node);
@@ -99,39 +100,69 @@ fn main() -> Result<()> {
         }
     }
 
+    println!("Total nodes in DB: {}", db.count_nodes()?);
+    let types = db.list_types()?;
+    println!("Total unique types indexed: {}", types.len());
+
+    // Basic CRUD Verification
+    println!("\n--- CRUD Verification ---");
+    let test_node = SchemaNode {
+        id: CompactString::new("http://test.org/1"),
+        types: vec![CompactString::new("TestType")],
+        properties: vec![Property {
+            name: CompactString::new("testProp"),
+            values: vec![SchemaValue::String(CompactString::new("testVal"))],
+            references: Vec::new(),
+        }],
+    };
+    db.upsert_batch(&[test_node.clone()])?;
+    assert!(db.with_node("http://test.org/1", |_| ())?.is_some());
+    println!("Upsert verified.");
+
+    let ids = db.get_ids_by_type("TestType")?;
+    assert!(ids.contains(&"http://test.org/1".to_string()));
+    println!("Index query verified.");
+
+    db.remove("http://test.org/1")?;
+    assert!(db.with_node("http://test.org/1", |_| ())?.is_none());
+    let ids = db.get_ids_by_type("TestType")?;
+    assert!(!ids.contains(&"http://test.org/1".to_string()));
+    println!("Remove verified.");
+
     // Benchmarking
     println!("\n--- Benchmarking ID: {} ---", test_id);
 
     // Warm up and verify
-    let guard = db.get_by_id(&test_id)?.expect("Test node not found");
-    let node = guard.get();
-    println!("Found node: {} with {} types", node.id, node.types.len());
+    db.with_node(&test_id, |node| {
+        println!("Found node: {} with {} types", node.id, node.types.len());
+    })?.expect("Test node not found");
 
     let iters = 1_000_000;
 
     // Benchmark rkyv zero-copy read (Total path)
     let start = Instant::now();
     for _ in 0..iters {
-        let guard = db.get_by_id(&test_id)?.unwrap();
-        let archived = guard.get();
-        std::hint::black_box(&archived.id);
-        std::hint::black_box(&archived.types);
+        let _ = db.with_node(&test_id, |archived| {
+            std::hint::black_box(&archived.id);
+            std::hint::black_box(&archived.types);
+        })?;
     }
     let duration_total_read = start.elapsed();
-    println!("Total SchemaDb read (txn + fetch + copy + validation) ({} iters): {:?}", iters, duration_total_read);
+    println!("Total SchemaDb read (txn + fetch + validation + closure) ({} iters): {:?}", iters, duration_total_read);
     println!("Average total read latency: {:?}", duration_total_read / iters);
 
-    // Pure zero-copy (simulated from buffer)
-    let guard = db.get_by_id(&test_id)?.unwrap();
-    let node_ref = guard.get();
-    let start = Instant::now();
-    for _ in 0..iters {
-        std::hint::black_box(&node_ref.id);
-        std::hint::black_box(&node_ref.types);
-    }
-    let duration_pure_access = start.elapsed();
-    println!("Pure zero-copy access ({} iters): {:?}", iters, duration_pure_access);
-    println!("Average pure access latency: {:?}", duration_pure_access / iters);
+    // Pure zero-copy access (simulated)
+    let _ = db.with_node(&test_id, |node_ref| {
+        let start = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(&node_ref.id);
+            std::hint::black_box(&node_ref.types);
+        }
+        let duration_pure_access = start.elapsed();
+        println!("Pure zero-copy access ({} iters): {:?}", iters, duration_pure_access);
+        println!("Average pure access latency: {:?}", duration_pure_access / iters);
+        Ok::<(), anyhow::Error>(())
+    })?.unwrap();
 
     // Compare with serde_json
     let json_node = serde_json::json!({
@@ -151,26 +182,38 @@ fn main() -> Result<()> {
     println!("serde_json parse ({} iters): {:?}", iters, duration_serde);
     println!("Average serde_json latency: {:?}", duration_serde / iters);
 
-    println!("\nSpeedup (Pure Access vs Serde): {:.2}x", duration_serde.as_secs_f64() / duration_pure_access.as_secs_f64());
+    println!("\nSpeedup (Total Read vs Serde): {:.2}x", duration_serde.as_secs_f64() / duration_total_read.as_secs_f64());
 
     Ok(())
 }
 
-fn convert_simd_value(val: &simd_json::BorrowedValue) -> Vec<SchemaValue> {
+fn convert_simd_value(val: &simd_json::BorrowedValue) -> (Vec<SchemaValue>, Vec<CompactString>) {
+    let mut values = Vec::new();
+    let mut refs = Vec::new();
+
     match val {
         simd_json::BorrowedValue::Static(s) => match s {
-            simd_json::StaticNode::Bool(b) => vec![SchemaValue::Bool(*b)],
-            simd_json::StaticNode::Null => vec![SchemaValue::Null],
-            simd_json::StaticNode::I64(i) => vec![SchemaValue::Integer(*i)],
-            simd_json::StaticNode::F64(f) => vec![SchemaValue::Float(*f)],
-            _ => vec![SchemaValue::Null],
+            simd_json::StaticNode::Bool(b) => values.push(SchemaValue::Bool(*b)),
+            simd_json::StaticNode::Null => values.push(SchemaValue::Null),
+            simd_json::StaticNode::I64(i) => values.push(SchemaValue::Integer(*i)),
+            simd_json::StaticNode::F64(f) => values.push(SchemaValue::Float(*f)),
+            _ => values.push(SchemaValue::Null),
         },
-        simd_json::BorrowedValue::String(s) => vec![SchemaValue::String(CompactString::new(s.as_ref()))],
+        simd_json::BorrowedValue::String(s) => values.push(SchemaValue::String(CompactString::new(s.as_ref()))),
         simd_json::BorrowedValue::Array(arr) => {
-            arr.iter().flat_map(convert_simd_value).collect()
+            for v in arr {
+                let (mut vs, mut rs) = convert_simd_value(v);
+                values.append(&mut vs);
+                refs.append(&mut rs);
+            }
         }
-        simd_json::BorrowedValue::Object(_) => {
-            vec![SchemaValue::String(CompactString::new("[Object]"))]
+        simd_json::BorrowedValue::Object(obj) => {
+            if let Some(id) = obj.get("@id").and_then(|v| v.as_str()) {
+                refs.push(CompactString::new(id));
+            } else {
+                values.push(SchemaValue::String(CompactString::new("[Nested Object]")));
+            }
         }
     }
+    (values, refs)
 }

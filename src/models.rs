@@ -3,19 +3,20 @@ use compact_str::CompactString;
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 #[archive(check_bytes)]
-pub struct Property {
-    pub name: CompactString,
-    pub values: Vec<SchemaValue>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-#[archive(check_bytes)]
 pub enum SchemaValue {
     Null,
     Bool(bool),
     Integer(i64),
     Float(f64),
     String(CompactString),
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[archive(check_bytes)]
+pub struct Property {
+    pub name: CompactString,
+    pub values: Vec<SchemaValue>,
+    pub references: Vec<CompactString>, // IDs of other nodes (@id)
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
