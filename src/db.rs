@@ -20,6 +20,8 @@ const PROPERTY_INDEX_TABLE: TableDefinition<(u32, u64), ()> = TableDefinition::n
 const VALUE_INDEX_TABLE: TableDefinition<(u32, &[u8], u64), ()> = TableDefinition::new("value_index");
 const NUMERIC_INDEX_TABLE: TableDefinition<(u32, i64, u64), ()> = TableDefinition::new("numeric_index_v2");
 const FTS_INDEX_TABLE: TableDefinition<(&str, u64), ()> = TableDefinition::new("fts_index");
+// (TargetNodeID, SourceNodeID) -> ()
+const INBOUND_REFS_TABLE: TableDefinition<(u64, u64), ()> = TableDefinition::new("inbound_refs");
 const COUNTER_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counter");
 
 pub struct SchemaDb {
@@ -49,6 +51,7 @@ impl SchemaDb {
             let _ = write_txn.open_table(VALUE_INDEX_TABLE)?;
             let _ = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
             let _ = write_txn.open_table(FTS_INDEX_TABLE)?;
+            let _ = write_txn.open_table(INBOUND_REFS_TABLE)?;
             let _ = write_txn.open_table(COUNTER_TABLE)?;
         }
         write_txn.commit()?;
@@ -77,6 +80,7 @@ impl SchemaDb {
             let mut value_table = write_txn.open_table(VALUE_INDEX_TABLE)?;
             let mut numeric_table = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
             let mut fts_table = write_txn.open_table(FTS_INDEX_TABLE)?;
+            let mut inbound_refs = write_txn.open_table(INBOUND_REFS_TABLE)?;
             let mut counter_table = write_txn.open_table(COUNTER_TABLE)?;
 
             let mut current_id_counter = counter_table.get("id_counter")?.map(|v| v.value()).unwrap_or(0);
@@ -112,6 +116,25 @@ impl SchemaDb {
                 for prop in &node.properties {
                     let u32_prop = Self::intern_string(prop.name.as_str(), &mut s2u_map, &mut u2s_map, &mut current_str_counter)?;
                     property_table.insert((u32_prop, u64_id), ())?;
+
+                    // Inbound references index
+                    for r in &prop.references {
+                        let target_u64 = {
+                            let mut tid = None;
+                            if let Some(access) = id_map.get(r.as_str())? {
+                                tid = Some(access.value());
+                            }
+                            if let Some(v) = tid {
+                                v
+                            } else {
+                                current_id_counter += 1;
+                                id_map.insert(r.as_str(), current_id_counter)?;
+                                u64_map.insert(current_id_counter, r.as_str())?;
+                                current_id_counter
+                            }
+                        };
+                        inbound_refs.insert((target_u64, u64_id), ())?;
+                    }
 
                     for val in &prop.values {
                         if let SchemaValue::String(s) = val {
@@ -204,7 +227,6 @@ impl SchemaDb {
 
         let s2u_map = read_txn.open_table(STRING_TO_U32)?;
 
-        // Intersect Type results
         if let Some(ty) = query.r#type {
             if let Some(access) = s2u_map.get(ty.as_str())? {
                 let u32_ty = access.value();
@@ -215,11 +237,10 @@ impl SchemaDb {
                 }
                 results = Some(ids);
             } else {
-                return Ok(()); // Type not found
+                return Ok(());
             }
         }
 
-        // Intersect Property results
         if let Some(prop) = query.property {
             if let Some(access) = s2u_map.get(prop.as_str())? {
                 let u32_prop = access.value();
@@ -239,7 +260,6 @@ impl SchemaDb {
             }
         }
 
-        // Intersect Keyword results
         if let Some(keyword) = query.keyword {
             let fts_table = read_txn.open_table(FTS_INDEX_TABLE)?;
             let mut ids = HashSet::new();
@@ -264,6 +284,29 @@ impl SchemaDb {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn for_each_inbound_ref<F>(&self, target_id: &str, mut f: F) -> Result<()>
+    where F: FnMut(&ArchivedSchemaNode)
+    {
+        let read_txn = self.db.begin_read()?;
+        let id_map = read_txn.open_table(ID_TO_U64)?;
+        let target_u64 = match id_map.get(target_id)? {
+            Some(v) => v.value(),
+            None => return Ok(()),
+        };
+
+        let inbound_table = read_txn.open_table(INBOUND_REFS_TABLE)?;
+        let nodes_table = read_txn.open_table(NODES_TABLE)?;
+
+        for entry in inbound_table.range((target_u64, 0)..(target_u64, u64::MAX))? {
+            let (key, _) = entry?;
+            let (_, source_u64) = key.value();
+            if let Some(access) = nodes_table.get(source_u64)? {
+                Self::with_validated_node(access.value(), |node| f(node))?;
+            }
+        }
         Ok(())
     }
 
@@ -519,6 +562,7 @@ impl SchemaDb {
             let mut value_table = write_txn.open_table(VALUE_INDEX_TABLE)?;
             let mut numeric_table = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
             let mut fts_table = write_txn.open_table(FTS_INDEX_TABLE)?;
+            let mut inbound_refs = write_txn.open_table(INBOUND_REFS_TABLE)?;
 
             let u64_id = {
                 let mut uid = None;
@@ -531,12 +575,13 @@ impl SchemaDb {
                 }
             };
 
-            let (types, props_with_vals) = {
+            let (types, props_with_vals, refs) = {
                 let result = nodes_table.get(u64_id)?;
                 if let Some(access) = result {
                     Self::with_validated_node(access.value(), |archived| {
                         let ts = archived.types.iter().map(|s| s.to_string()).collect::<Vec<String>>();
                         let mut pvs = Vec::new();
+                        let mut rs = Vec::new();
                         for p in archived.properties.iter() {
                             let p_name = p.name.to_string();
                             let mut vals = Vec::new();
@@ -547,8 +592,11 @@ impl SchemaDb {
                                 vals.push((v_owned, val_serializer.into_serializer().into_inner()));
                             }
                             pvs.push((p_name, vals));
+                            for r in p.references.iter() {
+                                rs.push(r.to_string());
+                            }
                         }
-                        (ts, pvs)
+                        (ts, pvs, rs)
                     })?
                 } else {
                     return Ok(());
@@ -563,6 +611,12 @@ impl SchemaDb {
                 if let Some(access) = s2u_map.get(ty.as_str())? {
                     types_table.remove((access.value(), u64_id))?;
                 }
+            }
+
+            for r in refs {
+                 if let Some(access) = id_map.get(r.as_str())? {
+                     inbound_refs.remove((access.value(), u64_id))?;
+                 }
             }
 
             for (prop_name, vals) in props_with_vals {

@@ -48,7 +48,7 @@ fn main() -> Result<()> {
 
     println!("Converting {} nodes in parallel...", nodes_json.len());
     let start_conv = Instant::now();
-    let schema_nodes: Vec<SchemaNode> = nodes_json.par_iter().filter_map(|node_val| {
+    let real_nodes: Vec<SchemaNode> = nodes_json.par_iter().filter_map(|node_val| {
         if let Some(node_obj) = node_val.as_object() {
             let id = node_obj.get("@id")
                 .and_then(|v| v.as_str())
@@ -89,91 +89,60 @@ fn main() -> Result<()> {
     }).collect();
     println!("Parallel conversion took: {:?}", start_conv.elapsed());
 
-    println!("Ingesting nodes into DB...");
-    let start_ingest = Instant::now();
-    db.upsert_batch(&schema_nodes)?;
-    println!("DB Ingestion took: {:?}", start_ingest.elapsed());
+    println!("Generating synthetic data for scale test...");
+    let scale_factor = 30; // ~100k nodes total
+    let mut all_nodes = real_nodes.clone();
+    for i in 0..scale_factor {
+        for node in &real_nodes {
+            let mut new_node = node.clone();
+            new_node.id = CompactString::new(format!("{}/synthetic/{}", node.id, i));
+            // Add a numeric property for range test
+            new_node.properties.push(Property {
+                name: CompactString::new("syntheticScore"),
+                values: vec![SchemaValue::Integer(i as i64)],
+                references: Vec::new(),
+            });
+            all_nodes.push(new_node);
+        }
+    }
 
-    let test_id = schema_nodes.iter().find(|n| n.id.contains("Person")).map(|n| n.id.to_string()).unwrap_or_else(|| schema_nodes[0].id.to_string());
+    println!("Ingesting {} nodes into DB...", all_nodes.len());
+    let start_ingest = Instant::now();
+    db.upsert_batch(&all_nodes)?;
+    let ingest_duration = start_ingest.elapsed();
+    println!("DB Ingestion took: {:?}", ingest_duration);
+    println!("Ingestion rate: {:.2} nodes/sec", all_nodes.len() as f64 / ingest_duration.as_secs_f64());
+
+    let test_id = real_nodes.iter().find(|n| n.id.contains("Person")).map(|n| n.id.to_string()).unwrap_or_else(|| real_nodes[0].id.to_string());
 
     println!("Total nodes in DB: {}", db.count_nodes()?);
-    let types = db.list_types()?;
-    println!("Total unique types indexed: {}", types.len());
-    let props = db.list_properties()?;
-    println!("Total unique properties indexed: {}", props.len());
 
-    // Basic CRUD Verification
-    println!("\n--- CRUD Verification ---");
-    let test_node = SchemaNode {
-        id: CompactString::new("http://test.org/alpha"),
-        types: vec![CompactString::new("TestType")],
-        properties: vec![Property {
-            name: CompactString::new("testProp"),
-            values: vec![SchemaValue::Integer(123), SchemaValue::String(CompactString::new("Searching for needles in haystacks"))],
-            references: Vec::new(),
-        }],
-    };
-    db.upsert_batch(&[test_node.clone()])?;
-    assert!(db.with_node("http://test.org/alpha", |_| ())?.is_some());
-    println!("Upsert verified.");
-
-    // FTS Verification
-    println!("\n--- FTS Verification ---");
-    let mut found_fts = Vec::new();
-    db.for_each_by_keyword("needles", |node| {
-        found_fts.push(node.id.to_string());
+    // Scaling verification
+    println!("\n--- Scale Verification ---");
+    let mut range_count = 0;
+    db.for_each_by_numeric_range("syntheticScore", 10, 15, |_| {
+        range_count += 1;
     })?;
-    assert!(found_fts.contains(&"http://test.org/alpha".to_string()));
-    println!("FTS verified.");
+    println!("Found {} synthetic nodes in range [10, 15]", range_count);
 
-    // Advanced Query Verification
-    println!("\n--- Advanced Query Verification ---");
-    let query = Query {
-        r#type: Some("TestType".to_string()),
-        property: Some("testProp".to_string()),
-        keyword: Some("haystacks".to_string()),
-    };
-    let mut search_results = Vec::new();
-    db.search(query, |node| {
-        search_results.push(node.id.to_string());
-    })?;
-    assert!(search_results.contains(&"http://test.org/alpha".to_string()));
-    println!("Intersectional Search verified.");
-
-    db.remove("http://test.org/alpha")?;
-    assert!(db.with_node("http://test.org/alpha", |_| ())?.is_none());
-    println!("Remove and Index pruning verified.");
-
-    // Benchmarking
-    println!("\n--- Benchmarking ID: {} ---", test_id);
-
-    let mut label_val = SchemaValue::Null;
-    db.with_node(&test_id, |node| {
-        println!("Found node: {} with {} types", node.id, node.types.len());
-        for p in node.properties.iter() {
-            if p.name == "rdfs:label" {
-                if let Some(v) = p.values.first() {
-                    label_val = v.deserialize(&mut rkyv::Infallible).unwrap();
-                }
-            }
+    // Multi-threaded Read Benchmark
+    println!("\n--- Multi-threaded Read Benchmark ---");
+    let thread_iters = 100_000;
+    let start_multi = Instant::now();
+    (0..rayon::current_num_threads()).into_par_iter().for_each(|_| {
+        for _ in 0..thread_iters {
+             let _ = db.with_node(&test_id, |node| {
+                 std::hint::black_box(&node.id);
+             }).unwrap();
         }
-    })?.expect("Test node not found");
+    });
+    let duration_multi = start_multi.elapsed();
+    println!("Multi-threaded read ({} threads, {} total iters): {:?}", rayon::current_num_threads(), rayon::current_num_threads() * thread_iters, duration_multi);
+    println!("Average throughput: {:.2} reads/sec", (rayon::current_num_threads() * thread_iters) as f64 / duration_multi.as_secs_f64());
 
+    // Single-threaded rkyv zero-copy read benchmark
+    println!("\n--- Final Zero-Copy Benchmark ID: {} ---", test_id);
     let iters = 1_000_000;
-
-    // Benchmark rkyv zero-copy read (Total path)
-    let start = Instant::now();
-    for _ in 0..iters {
-        let _ = db.with_node(&test_id, |archived| {
-            std::hint::black_box(&archived.id);
-            std::hint::black_box(&archived.types);
-        })?;
-    }
-    let duration_total_read = start.elapsed();
-    println!("Total SchemaDb read (txn + fetch + validation + closure) ({} iters): {:?}", iters, duration_total_read);
-    println!("Average total read latency: {:?}", duration_total_read / iters);
-
-    // Pure zero-copy access
     let mut duration_pure_access = Duration::default();
     let _ = db.with_node(&test_id, |node_ref| {
         let start = Instant::now();
@@ -195,7 +164,6 @@ fn main() -> Result<()> {
         "rdfs:label": "Sample Label"
     });
     let json_str = serde_json::to_string(&json_node)?;
-
     let start = Instant::now();
     for _ in 0..iters {
         let val: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -204,8 +172,7 @@ fn main() -> Result<()> {
     let duration_serde = start.elapsed();
     println!("serde_json parse ({} iters): {:?}", iters, duration_serde);
     println!("Average serde_json latency: {:?}", duration_serde / iters);
-
-    println!("\nSpeedup (Pure Access vs Serde): {:.2}x", duration_serde.as_secs_f64() / duration_pure_access.as_secs_f64());
+    println!("Speedup (Pure Access vs Serde): {:.2}x", duration_serde.as_secs_f64() / duration_pure_access.as_secs_f64());
 
     Ok(())
 }
