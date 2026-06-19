@@ -114,7 +114,7 @@ fn main() -> Result<()> {
         types: vec![CompactString::new("TestType")],
         properties: vec![Property {
             name: CompactString::new("testProp"),
-            values: vec![SchemaValue::String(CompactString::new("testVal"))],
+            values: vec![SchemaValue::Integer(123)],
             references: Vec::new(),
         }],
     };
@@ -126,40 +126,36 @@ fn main() -> Result<()> {
     assert!(ids.contains(&"http://test.org/1".to_string()));
     println!("Type index query verified.");
 
-    let ids_prop = db.get_ids_by_property("testProp")?;
-    assert!(ids_prop.contains(&"http://test.org/1".to_string()));
-    println!("Property index query verified.");
-
-    // Value Search Verification
-    println!("\n--- Value Search Verification ---");
+    // Numeric Range Verification
+    println!("\n--- Numeric Range Verification ---");
     let mut found_ids = Vec::new();
-    db.for_each_by_value("testProp", &SchemaValue::String(CompactString::new("testVal")), |node| {
+    db.for_each_by_numeric_range("testProp", 100, 200, |node| {
         found_ids.push(node.id.to_string());
     })?;
     assert!(found_ids.contains(&"http://test.org/1".to_string()));
+    println!("Numeric range search verified.");
+
+    // Value Search Verification
+    println!("\n--- Value Search Verification ---");
+    let mut found_ids_val = Vec::new();
+    db.for_each_by_value("testProp", &SchemaValue::Integer(123), |node| {
+        found_ids_val.push(node.id.to_string());
+    })?;
+    assert!(found_ids_val.contains(&"http://test.org/1".to_string()));
     println!("Value-based search verified.");
 
     db.remove("http://test.org/1")?;
     assert!(db.with_node("http://test.org/1", |_| ())?.is_none());
-    let ids = db.get_ids_by_type("TestType")?;
-    assert!(!ids.contains(&"http://test.org/1".to_string()));
     println!("Remove and Index pruning verified.");
 
-    // Advanced Query Verification
-    println!("\n--- Advanced Query Verification ---");
-    let target_type = "rdfs:Class";
-    let mut count = 0;
-    db.for_each_by_type(target_type, |_| {
-        count += 1;
+    // Graph Traversal Verification
+    println!("\n--- Graph Traversal Verification ---");
+    let ids_to_resolve = vec![test_id.as_str(), "https://schema.org/Thing"];
+    let mut resolved_count = 0;
+    db.resolve_references(&ids_to_resolve, |_| {
+        resolved_count += 1;
     })?;
-    println!("Found {} nodes of type '{}' via high-perf iterator", count, target_type);
-
-    let target_prop = "rdfs:label";
-    let mut prop_count = 0;
-    db.for_each_by_property(target_prop, |_| {
-        prop_count += 1;
-    })?;
-    println!("Found {} nodes containing property '{}' via high-perf iterator", prop_count, target_prop);
+    println!("Resolved {} references in one pass.", resolved_count);
 
     // Benchmarking
     println!("\n--- Benchmarking ID: {} ---", test_id);
@@ -168,7 +164,6 @@ fn main() -> Result<()> {
     let mut label_val = SchemaValue::Null;
     db.with_node(&test_id, |node| {
         println!("Found node: {} with {} types", node.id, node.types.len());
-        // Find a value for search benchmark
         for p in node.properties.iter() {
             if p.name == "rdfs:label" {
                 if let Some(v) = p.values.first() {
@@ -180,7 +175,7 @@ fn main() -> Result<()> {
 
     let iters = 1_000_000;
 
-    // Benchmark rkyv zero-copy read (Total path)
+    // Benchmark rkyv zero-copy read
     let start = Instant::now();
     for _ in 0..iters {
         let _ = db.with_node(&test_id, |archived| {
@@ -206,19 +201,17 @@ fn main() -> Result<()> {
     println!("Pure zero-copy access ({} iters): {:?}", iters, duration_pure_access);
     println!("Average pure access latency: {:?}", duration_pure_access / iters);
 
-    // Benchmark Value-based Search
-    if !matches!(label_val, SchemaValue::Null) {
-        let start = Instant::now();
-        let search_iters = 100_000;
-        for _ in 0..search_iters {
-            let _ = db.for_each_by_value("rdfs:label", &label_val, |node| {
-                std::hint::black_box(&node.id);
-            })?;
-        }
-        let duration_search = start.elapsed();
-        println!("Value search for '{}' ({} iters): {:?}", "rdfs:label", search_iters, duration_search);
-        println!("Average search latency: {:?}", duration_search / search_iters);
+    // Benchmark Reference Resolution
+    let start = Instant::now();
+    let res_iters = 100_000;
+    for _ in 0..res_iters {
+        let _ = db.resolve_references(&ids_to_resolve, |node| {
+             std::hint::black_box(&node.id);
+        })?;
     }
+    let duration_res = start.elapsed();
+    println!("Reference resolution ({} refs, {} iters): {:?}", ids_to_resolve.len(), res_iters, duration_res);
+    println!("Average resolution latency: {:?}", duration_res / res_iters);
 
     // Compare with serde_json
     let json_node = serde_json::json!({

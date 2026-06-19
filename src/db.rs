@@ -17,6 +17,7 @@ const U32_TO_STRING: TableDefinition<u32, &str> = TableDefinition::new("u32_to_s
 const TYPES_INDEX_TABLE: TableDefinition<(u32, u64), ()> = TableDefinition::new("types_index_v4");
 const PROPERTY_INDEX_TABLE: TableDefinition<(u32, u64), ()> = TableDefinition::new("property_index_v3");
 const VALUE_INDEX_TABLE: TableDefinition<(u32, &[u8], u64), ()> = TableDefinition::new("value_index");
+const NUMERIC_INDEX_TABLE: TableDefinition<(u32, i64, u64), ()> = TableDefinition::new("numeric_index_v2");
 const COUNTER_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counter");
 
 pub struct SchemaDb {
@@ -37,6 +38,7 @@ impl SchemaDb {
             let _ = write_txn.open_table(TYPES_INDEX_TABLE)?;
             let _ = write_txn.open_table(PROPERTY_INDEX_TABLE)?;
             let _ = write_txn.open_table(VALUE_INDEX_TABLE)?;
+            let _ = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
             let _ = write_txn.open_table(COUNTER_TABLE)?;
         }
         write_txn.commit()?;
@@ -55,6 +57,7 @@ impl SchemaDb {
             let mut types_table = write_txn.open_table(TYPES_INDEX_TABLE)?;
             let mut property_table = write_txn.open_table(PROPERTY_INDEX_TABLE)?;
             let mut value_table = write_txn.open_table(VALUE_INDEX_TABLE)?;
+            let mut numeric_table = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
             let mut counter_table = write_txn.open_table(COUNTER_TABLE)?;
 
             let mut current_id_counter = counter_table.get("id_counter")?.map(|v| v.value()).unwrap_or(0);
@@ -83,46 +86,32 @@ impl SchemaDb {
                 nodes_table.insert(u64_id, node_bytes.as_slice())?;
 
                 for ty in &node.types {
-                    let u32_ty = {
-                        let mut tid = None;
-                        if let Some(access) = s2u_map.get(ty.as_str())? {
-                            tid = Some(access.value());
-                        }
-                        if let Some(v) = tid {
-                            v
-                        } else {
-                            current_str_counter += 1;
-                            s2u_map.insert(ty.as_str(), current_str_counter)?;
-                            u2s_map.insert(current_str_counter, ty.as_str())?;
-                            current_str_counter
-                        }
-                    };
+                    let u32_ty = Self::intern_string(ty.as_str(), &mut s2u_map, &mut u2s_map, &mut current_str_counter)?;
                     types_table.insert((u32_ty, u64_id), ())?;
                 }
 
                 for prop in &node.properties {
-                    let u32_prop = {
-                        let mut pid = None;
-                        if let Some(access) = s2u_map.get(prop.name.as_str())? {
-                            pid = Some(access.value());
-                        }
-                        if let Some(v) = pid {
-                            v
-                        } else {
-                            current_str_counter += 1;
-                            s2u_map.insert(prop.name.as_str(), current_str_counter)?;
-                            u2s_map.insert(current_str_counter, prop.name.as_str())?;
-                            current_str_counter
-                        }
-                    };
+                    let u32_prop = Self::intern_string(prop.name.as_str(), &mut s2u_map, &mut u2s_map, &mut current_str_counter)?;
                     property_table.insert((u32_prop, u64_id), ())?;
 
                     for val in &prop.values {
+                        // Value Index (Exact)
                         let mut val_serializer = AllocSerializer::<256>::default();
                         val_serializer.serialize_value(val)
                             .map_err(|e| anyhow::anyhow!("Value serialization failed: {}", e))?;
                         let val_bytes = val_serializer.into_serializer().into_inner();
                         value_table.insert((u32_prop, val_bytes.as_slice(), u64_id), ())?;
+
+                        // Numeric Index (Range)
+                        match val {
+                            SchemaValue::Integer(i) => {
+                                numeric_table.insert((u32_prop, *i, u64_id), ())?;
+                            }
+                            SchemaValue::Float(f) => {
+                                numeric_table.insert((u32_prop, *f as i64, u64_id), ())?;
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -131,6 +120,37 @@ impl SchemaDb {
         }
         write_txn.commit()?;
         Ok(())
+    }
+
+    fn intern_string(s: &str, s2u: &mut redb::Table<&str, u32>, u2s: &mut redb::Table<u32, &str>, counter: &mut u32) -> Result<u32> {
+        let mut id = None;
+        if let Some(access) = s2u.get(s)? {
+            id = Some(access.value());
+        }
+        if let Some(v) = id {
+            Ok(v)
+        } else {
+            *counter += 1;
+            s2u.insert(s, *counter)?;
+            u2s.insert(*counter, s)?;
+            Ok(*counter)
+        }
+    }
+
+    fn with_validated_node<F, R>(bytes: &[u8], f: F) -> Result<R>
+    where F: FnOnce(&ArchivedSchemaNode) -> R
+    {
+        if bytes.as_ptr() as usize % 8 == 0 {
+            let archived = check_archived_root::<SchemaNode>(bytes)
+                .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
+            Ok(f(archived))
+        } else {
+            let mut aligned = AlignedVec::new();
+            aligned.extend_from_slice(bytes);
+            let archived = check_archived_root::<SchemaNode>(&aligned)
+                .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
+            Ok(f(archived))
+        }
     }
 
     pub fn with_node<F, R>(&self, id: &str, f: F) -> Result<Option<R>>
@@ -147,18 +167,7 @@ impl SchemaDb {
         let result = nodes_table.get(u64_id)?;
 
         if let Some(access) = result {
-            let bytes = access.value();
-            if bytes.as_ptr() as usize % 8 == 0 {
-                let archived = check_archived_root::<SchemaNode>(bytes)
-                    .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
-                Ok(Some(f(archived)))
-            } else {
-                let mut aligned = AlignedVec::new();
-                aligned.extend_from_slice(bytes);
-                let archived = check_archived_root::<SchemaNode>(&aligned)
-                    .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
-                Ok(Some(f(archived)))
-            }
+            Ok(Some(Self::with_validated_node(access.value(), f)?))
         } else {
             Ok(None)
         }
@@ -188,18 +197,32 @@ impl SchemaDb {
             let (_, _, u64_id) = key.value();
 
             if let Some(access) = nodes_table.get(u64_id)? {
-                let bytes = access.value();
-                if bytes.as_ptr() as usize % 8 == 0 {
-                    let archived = check_archived_root::<SchemaNode>(bytes)
-                        .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
-                    f(archived);
-                } else {
-                    let mut aligned = AlignedVec::new();
-                    aligned.extend_from_slice(bytes);
-                    let archived = check_archived_root::<SchemaNode>(&aligned)
-                        .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
-                    f(archived);
-                }
+                Self::with_validated_node(access.value(), |node| f(node))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn for_each_by_numeric_range<F>(&self, prop_name: &str, min: i64, max: i64, mut f: F) -> Result<()>
+    where F: FnMut(&ArchivedSchemaNode)
+    {
+        let read_txn = self.db.begin_read()?;
+        let s2u_map = read_txn.open_table(STRING_TO_U32)?;
+        let u32_prop = match s2u_map.get(prop_name)? {
+            Some(v) => v.value(),
+            None => return Ok(()),
+        };
+
+        let numeric_table = read_txn.open_table(NUMERIC_INDEX_TABLE)?;
+        let nodes_table = read_txn.open_table(NODES_TABLE)?;
+
+        let range = (u32_prop, min, 0)..(u32_prop, max, u64::MAX);
+        for entry in numeric_table.range(range)? {
+            let (key, _) = entry?;
+            let (_, _, u64_id) = key.value();
+
+            if let Some(access) = nodes_table.get(u64_id)? {
+                Self::with_validated_node(access.value(), |node| f(node))?;
             }
         }
         Ok(())
@@ -224,18 +247,7 @@ impl SchemaDb {
             let (_, u64_id) = key.value();
 
             if let Some(access) = nodes_table.get(u64_id)? {
-                let bytes = access.value();
-                if bytes.as_ptr() as usize % 8 == 0 {
-                    let archived = check_archived_root::<SchemaNode>(bytes)
-                        .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
-                    f(archived);
-                } else {
-                    let mut aligned = AlignedVec::new();
-                    aligned.extend_from_slice(bytes);
-                    let archived = check_archived_root::<SchemaNode>(&aligned)
-                        .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
-                    f(archived);
-                }
+                Self::with_validated_node(access.value(), |node| f(node))?;
             }
         }
         Ok(())
@@ -260,18 +272,7 @@ impl SchemaDb {
             let (_, u64_id) = key.value();
 
             if let Some(access) = nodes_table.get(u64_id)? {
-                let bytes = access.value();
-                if bytes.as_ptr() as usize % 8 == 0 {
-                    let archived = check_archived_root::<SchemaNode>(bytes)
-                        .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
-                    f(archived);
-                } else {
-                    let mut aligned = AlignedVec::new();
-                    aligned.extend_from_slice(bytes);
-                    let archived = check_archived_root::<SchemaNode>(&aligned)
-                        .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
-                    f(archived);
-                }
+                Self::with_validated_node(access.value(), |node| f(node))?;
             }
         }
         Ok(())
@@ -363,6 +364,24 @@ impl SchemaDb {
         Ok(nodes_table.len()? as usize)
     }
 
+    pub fn resolve_references<F>(&self, ids: &[&str], mut f: F) -> Result<()>
+    where F: FnMut(&ArchivedSchemaNode)
+    {
+        let read_txn = self.db.begin_read()?;
+        let id_map = read_txn.open_table(ID_TO_U64)?;
+        let nodes_table = read_txn.open_table(NODES_TABLE)?;
+
+        for id in ids {
+            if let Some(u64_id_access) = id_map.get(*id)? {
+                let u64_id = u64_id_access.value();
+                if let Some(access) = nodes_table.get(u64_id)? {
+                    Self::with_validated_node(access.value(), |node| f(node))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn remove(&self, id: &str) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
@@ -370,7 +389,10 @@ impl SchemaDb {
             let mut id_map = write_txn.open_table(ID_TO_U64)?;
             let mut u64_map = write_txn.open_table(U64_TO_ID)?;
             let mut s2u_map = write_txn.open_table(STRING_TO_U32)?;
+            let mut types_table = write_txn.open_table(TYPES_INDEX_TABLE)?;
+            let mut property_table = write_txn.open_table(PROPERTY_INDEX_TABLE)?;
             let mut value_table = write_txn.open_table(VALUE_INDEX_TABLE)?;
+            let mut numeric_table = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
 
             let u64_id = {
                 let mut uid = None;
@@ -386,47 +408,22 @@ impl SchemaDb {
             let (types, props_with_vals) = {
                 let result = nodes_table.get(u64_id)?;
                 if let Some(access) = result {
-                    let bytes = access.value();
-
-                    let mut ts = Vec::new();
-                    let mut pvs = Vec::new();
-
-                    if bytes.as_ptr() as usize % 8 == 0 {
-                        let archived = check_archived_root::<SchemaNode>(bytes)
-                            .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
-                        ts = archived.types.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+                    Self::with_validated_node(access.value(), |archived| {
+                        let ts = archived.types.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+                        let mut pvs = Vec::new();
                         for p in archived.properties.iter() {
                             let p_name = p.name.to_string();
                             let mut vals = Vec::new();
                             for v in p.values.iter() {
                                 let v_owned: SchemaValue = v.deserialize(&mut rkyv::Infallible).unwrap();
                                 let mut val_serializer = AllocSerializer::<256>::default();
-                                val_serializer.serialize_value(&v_owned)
-                                    .map_err(|e| anyhow::anyhow!("Value serialization failed: {}", e))?;
-                                vals.push(val_serializer.into_serializer().into_inner());
+                                val_serializer.serialize_value(&v_owned).unwrap();
+                                vals.push((v_owned, val_serializer.into_serializer().into_inner()));
                             }
                             pvs.push((p_name, vals));
                         }
-                    } else {
-                        let mut aligned = AlignedVec::new();
-                        aligned.extend_from_slice(bytes);
-                        let archived = check_archived_root::<SchemaNode>(&aligned)
-                            .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
-                        ts = archived.types.iter().map(|s| s.to_string()).collect::<Vec<String>>();
-                        for p in archived.properties.iter() {
-                            let p_name = p.name.to_string();
-                            let mut vals = Vec::new();
-                            for v in p.values.iter() {
-                                let v_owned: SchemaValue = v.deserialize(&mut rkyv::Infallible).unwrap();
-                                let mut val_serializer = AllocSerializer::<256>::default();
-                                val_serializer.serialize_value(&v_owned)
-                                    .map_err(|e| anyhow::anyhow!("Value serialization failed: {}", e))?;
-                                vals.push(val_serializer.into_serializer().into_inner());
-                            }
-                            pvs.push((p_name, vals));
-                        }
-                    }
-                    (ts, pvs)
+                        (ts, pvs)
+                    })?
                 } else {
                     return Ok(());
                 }
@@ -436,20 +433,27 @@ impl SchemaDb {
             id_map.remove(id)?;
             u64_map.remove(u64_id)?;
 
-            let mut types_table = write_txn.open_table(TYPES_INDEX_TABLE)?;
             for ty in types {
-                if let Some(u32_ty) = s2u_map.get(ty.as_str())? {
-                    types_table.remove((u32_ty.value(), u64_id))?;
+                if let Some(access) = s2u_map.get(ty.as_str())? {
+                    types_table.remove((access.value(), u64_id))?;
                 }
             }
 
-            let mut property_table = write_txn.open_table(PROPERTY_INDEX_TABLE)?;
             for (prop_name, vals) in props_with_vals {
-                if let Some(u32_prop) = s2u_map.get(prop_name.as_str())? {
-                    let pid = u32_prop.value();
+                if let Some(access) = s2u_map.get(prop_name.as_str())? {
+                    let pid = access.value();
                     property_table.remove((pid, u64_id))?;
-                    for v_bytes in vals {
+                    for (v_owned, v_bytes) in vals {
                         value_table.remove((pid, v_bytes.as_slice(), u64_id))?;
+                        match v_owned {
+                            SchemaValue::Integer(i) => {
+                                numeric_table.remove((pid, i, u64_id))?;
+                            }
+                            SchemaValue::Float(f) => {
+                                numeric_table.remove((pid, f as i64, u64_id))?;
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
