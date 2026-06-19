@@ -103,6 +103,8 @@ fn main() -> Result<()> {
     println!("Total nodes in DB: {}", db.count_nodes()?);
     let types = db.list_types()?;
     println!("Total unique types indexed: {}", types.len());
+    let props = db.list_properties()?;
+    println!("Total unique properties indexed: {}", props.len());
 
     // Basic CRUD Verification
     println!("\n--- CRUD Verification ---");
@@ -121,13 +123,19 @@ fn main() -> Result<()> {
 
     let ids = db.get_ids_by_type("TestType")?;
     assert!(ids.contains(&"http://test.org/1".to_string()));
-    println!("Index query verified.");
+    println!("Type index query verified.");
+
+    let ids_prop = db.get_ids_by_property("testProp")?;
+    assert!(ids_prop.contains(&"http://test.org/1".to_string()));
+    println!("Property index query verified.");
 
     db.remove("http://test.org/1")?;
     assert!(db.with_node("http://test.org/1", |_| ())?.is_none());
     let ids = db.get_ids_by_type("TestType")?;
     assert!(!ids.contains(&"http://test.org/1".to_string()));
-    println!("Remove verified.");
+    let ids_prop = db.get_ids_by_property("testProp")?;
+    assert!(!ids_prop.contains(&"http://test.org/1".to_string()));
+    println!("Remove and Index pruning verified.");
 
     // Advanced Query Verification
     println!("\n--- Advanced Query Verification ---");
@@ -137,6 +145,13 @@ fn main() -> Result<()> {
         count += 1;
     })?;
     println!("Found {} nodes of type '{}' via high-perf iterator", count, target_type);
+
+    let target_prop = "rdfs:label";
+    let mut prop_count = 0;
+    db.for_each_by_property(target_prop, |_| {
+        prop_count += 1;
+    })?;
+    println!("Found {} nodes containing property '{}' via high-perf iterator", prop_count, target_prop);
 
     // Benchmarking
     println!("\n--- Benchmarking ID: {} ---", test_id);
