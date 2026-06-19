@@ -7,10 +7,9 @@ use rkyv::{
 };
 use std::path::Path;
 use crate::models::{SchemaNode, ArchivedSchemaNode};
-use std::collections::HashMap;
 
 const NODES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
-const TYPES_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("types_index");
+const TYPES_INDEX_TABLE: TableDefinition<(&str, &str), ()> = TableDefinition::new("types_index_v2");
 
 pub struct SchemaDb {
     db: Database,
@@ -36,53 +35,24 @@ impl SchemaDb {
             let mut nodes_table = write_txn.open_table(NODES_TABLE)?;
             let mut types_table = write_txn.open_table(TYPES_INDEX_TABLE)?;
 
-            let mut type_updates: HashMap<String, Vec<String>> = HashMap::new();
+            // Reuse serializer buffer to reduce allocations
+            let mut serializer = AllocSerializer::<2048>::default();
 
             for node in nodes {
-                let mut serializer = AllocSerializer::<1024>::default();
                 serializer.serialize_value(node)
                     .map_err(|e| anyhow::anyhow!("Node serialization failed: {}", e))?;
                 let node_bytes = serializer.into_serializer().into_inner();
                 nodes_table.insert(node.id.as_str(), node_bytes.as_slice())?;
 
                 for ty in &node.types {
-                    type_updates.entry(ty.to_string()).or_default().push(node.id.to_string());
-                }
-            }
-
-            for (ty, new_ids) in type_updates {
-                let mut ids = if let Some(access) = types_table.get(ty.as_str())? {
-                    let bytes = access.value();
-                    if bytes.as_ptr() as usize % 8 == 0 {
-                        let archived = check_archived_root::<Vec<String>>(bytes)
-                            .map_err(|e| anyhow::anyhow!("Type index validation failed: {}", e))?;
-                        archived.iter().map(|s| s.to_string()).collect::<Vec<String>>()
-                    } else {
-                        let mut aligned = AlignedVec::new();
-                        aligned.extend_from_slice(bytes);
-                        let archived = check_archived_root::<Vec<String>>(&aligned)
-                            .map_err(|e| anyhow::anyhow!("Type index validation failed: {}", e))?;
-                        archived.iter().map(|s| s.to_string()).collect::<Vec<String>>()
-                    }
-                } else {
-                    Vec::new()
-                };
-
-                let mut changed = false;
-                for id in new_ids {
-                    if !ids.contains(&id) {
-                        ids.push(id);
-                        changed = true;
-                    }
+                    types_table.insert((ty.as_str(), node.id.as_str()), ())?;
                 }
 
-                if changed {
-                    let mut serializer = AllocSerializer::<1024>::default();
-                    serializer.serialize_value(&ids)
-                        .map_err(|e| anyhow::anyhow!("Type index serialization failed: {}", e))?;
-                    let ids_bytes = serializer.into_serializer().into_inner();
-                    types_table.insert(ty.as_str(), ids_bytes.as_slice())?;
-                }
+                // Clear the serializer for the next node, reusing its internal buffer
+                serializer = AllocSerializer::<2048>::default();
+                // Note: AllocSerializer doesn't have a simple 'clear' that resets the pointer easily
+                // in 0.7 without re-creating. But we can reuse the memory if we use a custom serializer.
+                // For now, even creating a new one is fast, but we'll try to keep it efficient.
             }
         }
         write_txn.commit()?;
@@ -114,36 +84,62 @@ impl SchemaDb {
         }
     }
 
+    pub fn for_each_by_type<F>(&self, ty: &str, mut f: F) -> Result<()>
+    where F: FnMut(&ArchivedSchemaNode)
+    {
+        let read_txn = self.db.begin_read()?;
+        let types_table = read_txn.open_table(TYPES_INDEX_TABLE)?;
+        let nodes_table = read_txn.open_table(NODES_TABLE)?;
+
+        let range = (ty, "")..=(ty, "\u{10FFFF}");
+        for entry in types_table.range(range)? {
+            let (key, _) = entry?;
+            let (_, id) = key.value();
+
+            if let Some(access) = nodes_table.get(id)? {
+                let bytes = access.value();
+                if bytes.as_ptr() as usize % 8 == 0 {
+                    let archived = check_archived_root::<SchemaNode>(bytes)
+                        .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
+                    f(archived);
+                } else {
+                    let mut aligned = AlignedVec::new();
+                    aligned.extend_from_slice(bytes);
+                    let archived = check_archived_root::<SchemaNode>(&aligned)
+                        .map_err(|e| anyhow::anyhow!("Validation failed: {}", e))?;
+                    f(archived);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn get_ids_by_type(&self, ty: &str) -> Result<Vec<String>> {
         let read_txn = self.db.begin_read()?;
         let types_table = read_txn.open_table(TYPES_INDEX_TABLE)?;
-        if let Some(access) = types_table.get(ty)? {
-            let bytes = access.value();
-            if bytes.as_ptr() as usize % 8 == 0 {
-                let archived = check_archived_root::<Vec<String>>(bytes)
-                    .map_err(|e| anyhow::anyhow!("Type index validation failed: {}", e))?;
-                Ok(archived.iter().map(|s| s.to_string()).collect())
-            } else {
-                let mut aligned = AlignedVec::new();
-                aligned.extend_from_slice(bytes);
-                let archived = check_archived_root::<Vec<String>>(&aligned)
-                    .map_err(|e| anyhow::anyhow!("Type index validation failed: {}", e))?;
-                Ok(archived.iter().map(|s| s.to_string()).collect())
-            }
-        } else {
-            Ok(Vec::new())
+
+        let mut ids = Vec::new();
+        let range = (ty, "")..=(ty, "\u{10FFFF}");
+        for entry in types_table.range(range)? {
+            let (key, _) = entry?;
+            let (_, id) = key.value();
+            ids.push(id.to_string());
         }
+        Ok(ids)
     }
 
     pub fn list_types(&self) -> Result<Vec<String>> {
         let read_txn = self.db.begin_read()?;
         let types_table = read_txn.open_table(TYPES_INDEX_TABLE)?;
-        let mut types = Vec::new();
+        let mut types = std::collections::HashSet::new();
         for entry in types_table.iter()? {
             let (key, _) = entry?;
-            types.push(key.value().to_string());
+            let (ty, _) = key.value();
+            types.insert(ty.to_string());
         }
-        Ok(types)
+        let mut types_vec: Vec<String> = types.into_iter().collect();
+        types_vec.sort();
+        Ok(types_vec)
     }
 
     pub fn count_nodes(&self) -> Result<usize> {
@@ -181,37 +177,7 @@ impl SchemaDb {
 
             let mut types_table = write_txn.open_table(TYPES_INDEX_TABLE)?;
             for ty in types {
-                let ids_to_update = if let Some(access) = types_table.get(ty.as_str())? {
-                    let bytes = access.value();
-                    let mut ids = if bytes.as_ptr() as usize % 8 == 0 {
-                        let archived = check_archived_root::<Vec<String>>(bytes)
-                            .map_err(|e| anyhow::anyhow!("Type index validation failed: {}", e))?;
-                        archived.iter().map(|s| s.to_string()).collect::<Vec<String>>()
-                    } else {
-                        let mut aligned = AlignedVec::new();
-                        aligned.extend_from_slice(bytes);
-                        let archived = check_archived_root::<Vec<String>>(&aligned)
-                            .map_err(|e| anyhow::anyhow!("Type index validation failed: {}", e))?;
-                        archived.iter().map(|s| s.to_string()).collect::<Vec<String>>()
-                    };
-
-                    ids.retain(|x| x != id);
-                    Some(ids)
-                } else {
-                    None
-                };
-
-                if let Some(ids) = ids_to_update {
-                    if ids.is_empty() {
-                        types_table.remove(ty.as_str())?;
-                    } else {
-                        let mut serializer = AllocSerializer::<1024>::default();
-                        serializer.serialize_value(&ids)
-                            .map_err(|e| anyhow::anyhow!("Type index serialization failed: {}", e))?;
-                        let ids_bytes = serializer.into_serializer().into_inner();
-                        types_table.insert(ty.as_str(), ids_bytes.as_slice())?;
-                    }
-                }
+                types_table.remove((ty.as_str(), id))?;
             }
         }
         write_txn.commit()?;

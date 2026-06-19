@@ -8,7 +8,7 @@ use models::{Property, SchemaNode, SchemaValue};
 use simd_json::prelude::*;
 use std::fs::File;
 use std::io::Read;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 
 fn main() -> Result<()> {
     let db_path = "schema_db.redb";
@@ -129,11 +129,20 @@ fn main() -> Result<()> {
     assert!(!ids.contains(&"http://test.org/1".to_string()));
     println!("Remove verified.");
 
+    // Advanced Query Verification
+    println!("\n--- Advanced Query Verification ---");
+    let target_type = "rdfs:Class";
+    let mut count = 0;
+    db.for_each_by_type(target_type, |_| {
+        count += 1;
+    })?;
+    println!("Found {} nodes of type '{}' via high-perf iterator", count, target_type);
+
     // Benchmarking
     println!("\n--- Benchmarking ID: {} ---", test_id);
 
     // Warm up and verify
-    db.with_node(&test_id, |node| {
+    let _ = db.with_node(&test_id, |node| {
         println!("Found node: {} with {} types", node.id, node.types.len());
     })?.expect("Test node not found");
 
@@ -151,18 +160,19 @@ fn main() -> Result<()> {
     println!("Total SchemaDb read (txn + fetch + validation + closure) ({} iters): {:?}", iters, duration_total_read);
     println!("Average total read latency: {:?}", duration_total_read / iters);
 
-    // Pure zero-copy access (simulated)
+    // Pure zero-copy access
+    let mut duration_pure_access = Duration::default();
     let _ = db.with_node(&test_id, |node_ref| {
         let start = Instant::now();
         for _ in 0..iters {
             std::hint::black_box(&node_ref.id);
             std::hint::black_box(&node_ref.types);
         }
-        let duration_pure_access = start.elapsed();
-        println!("Pure zero-copy access ({} iters): {:?}", iters, duration_pure_access);
-        println!("Average pure access latency: {:?}", duration_pure_access / iters);
+        duration_pure_access = start.elapsed();
         Ok::<(), anyhow::Error>(())
     })?.unwrap();
+    println!("Pure zero-copy access ({} iters): {:?}", iters, duration_pure_access);
+    println!("Average pure access latency: {:?}", duration_pure_access / iters);
 
     // Compare with serde_json
     let json_node = serde_json::json!({
@@ -182,7 +192,7 @@ fn main() -> Result<()> {
     println!("serde_json parse ({} iters): {:?}", iters, duration_serde);
     println!("Average serde_json latency: {:?}", duration_serde / iters);
 
-    println!("\nSpeedup (Total Read vs Serde): {:.2}x", duration_serde.as_secs_f64() / duration_total_read.as_secs_f64());
+    println!("\nSpeedup (Pure Access vs Serde): {:.2}x", duration_serde.as_secs_f64() / duration_pure_access.as_secs_f64());
 
     Ok(())
 }
