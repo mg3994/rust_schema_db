@@ -1,0 +1,3 @@
+schema_db.redb
+target/
+Cargo.lock
