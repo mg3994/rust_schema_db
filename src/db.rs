@@ -8,7 +8,7 @@ use rkyv::{
 };
 use std::path::Path;
 use crate::models::{SchemaNode, ArchivedSchemaNode, SchemaValue};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 const NODES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes_v2");
 const ID_TO_U64: TableDefinition<&str, u64> = TableDefinition::new("id_to_u64");
@@ -20,15 +20,19 @@ const PROPERTY_INDEX_TABLE: TableDefinition<(u32, u64), ()> = TableDefinition::n
 const VALUE_INDEX_TABLE: TableDefinition<(u32, &[u8], u64), ()> = TableDefinition::new("value_index");
 const NUMERIC_INDEX_TABLE: TableDefinition<(u32, i64, u64), ()> = TableDefinition::new("numeric_index_v2");
 const FTS_INDEX_TABLE: TableDefinition<(&str, u64), ()> = TableDefinition::new("fts_index");
-// (TargetNodeID, SourceNodeID) -> ()
 const INBOUND_REFS_TABLE: TableDefinition<(u64, u64), ()> = TableDefinition::new("inbound_refs");
+const CARDINALITY_TABLE: TableDefinition<(u8, &str), u64> = TableDefinition::new("cardinality");
 const COUNTER_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counter");
+
+pub const KIND_TYPE: u8 = 1;
+pub const KIND_PROP: u8 = 2;
+pub const KIND_FTS: u8 = 3;
 
 pub struct SchemaDb {
     db: Database,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Query {
     pub r#type: Option<String>,
     pub property: Option<String>,
@@ -52,6 +56,7 @@ impl SchemaDb {
             let _ = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
             let _ = write_txn.open_table(FTS_INDEX_TABLE)?;
             let _ = write_txn.open_table(INBOUND_REFS_TABLE)?;
+            let _ = write_txn.open_table(CARDINALITY_TABLE)?;
             let _ = write_txn.open_table(COUNTER_TABLE)?;
         }
         write_txn.commit()?;
@@ -81,6 +86,7 @@ impl SchemaDb {
             let mut numeric_table = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
             let mut fts_table = write_txn.open_table(FTS_INDEX_TABLE)?;
             let mut inbound_refs = write_txn.open_table(INBOUND_REFS_TABLE)?;
+            let mut card_table = write_txn.open_table(CARDINALITY_TABLE)?;
             let mut counter_table = write_txn.open_table(COUNTER_TABLE)?;
 
             let mut current_id_counter = counter_table.get("id_counter")?.map(|v| v.value()).unwrap_or(0);
@@ -102,7 +108,9 @@ impl SchemaDb {
                     }
                 };
 
-                let mut serializer = AllocSerializer::<1024>::default();
+                // Serialization with fixed-size serializer and explicit scratch to reduce allocations if possible
+                // (though AllocSerializer is quite optimized already in 0.7)
+                let mut serializer = AllocSerializer::<2048>::default();
                 serializer.serialize_value(node)
                     .map_err(|e| anyhow::anyhow!("Node serialization failed: {}", e))?;
                 let node_bytes = serializer.into_serializer().into_inner();
@@ -110,14 +118,19 @@ impl SchemaDb {
 
                 for ty in &node.types {
                     let u32_ty = Self::intern_string(ty.as_str(), &mut s2u_map, &mut u2s_map, &mut current_str_counter)?;
-                    types_table.insert((u32_ty, u64_id), ())?;
+                    if types_table.get((u32_ty, u64_id))?.is_none() {
+                        types_table.insert((u32_ty, u64_id), ())?;
+                        Self::increment_cardinality(&mut card_table, KIND_TYPE, ty.as_str())?;
+                    }
                 }
 
                 for prop in &node.properties {
                     let u32_prop = Self::intern_string(prop.name.as_str(), &mut s2u_map, &mut u2s_map, &mut current_str_counter)?;
-                    property_table.insert((u32_prop, u64_id), ())?;
+                    if property_table.get((u32_prop, u64_id))?.is_none() {
+                        property_table.insert((u32_prop, u64_id), ())?;
+                        Self::increment_cardinality(&mut card_table, KIND_PROP, prop.name.as_str())?;
+                    }
 
-                    // Inbound references index
                     for r in &prop.references {
                         let target_u64 = {
                             let mut tid = None;
@@ -139,7 +152,10 @@ impl SchemaDb {
                     for val in &prop.values {
                         if let SchemaValue::String(s) = val {
                             for token in Self::tokenize(s.as_str()) {
-                                fts_table.insert((token.as_str(), u64_id), ())?;
+                                if fts_table.get((token.as_str(), u64_id))?.is_none() {
+                                    fts_table.insert((token.as_str(), u64_id), ())?;
+                                    Self::increment_cardinality(&mut card_table, KIND_FTS, token.as_str())?;
+                                }
                             }
                         }
 
@@ -166,6 +182,38 @@ impl SchemaDb {
         }
         write_txn.commit()?;
         Ok(())
+    }
+
+    fn increment_cardinality(table: &mut redb::Table<(u8, &str), u64>, kind: u8, key: &str) -> Result<()> {
+        let mut count = 0;
+        if let Some(access) = table.get((kind, key))? {
+            count = access.value();
+        }
+        table.insert((kind, key), count + 1)?;
+        Ok(())
+    }
+
+    fn decrement_cardinality(table: &mut redb::Table<(u8, &str), u64>, kind: u8, key: &str) -> Result<()> {
+        let mut count = 0;
+        let mut exists = false;
+        if let Some(access) = table.get((kind, key))? {
+            count = access.value();
+            exists = true;
+        }
+        if exists {
+            if count <= 1 {
+                table.remove((kind, key))?;
+            } else {
+                table.insert((kind, key), count - 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_cardinality(&self, kind: u8, key: &str) -> Result<u64> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(CARDINALITY_TABLE)?;
+        Ok(table.get((kind, key))?.map(|v| v.value()).unwrap_or(0))
     }
 
     fn intern_string(s: &str, s2u: &mut redb::Table<&str, u32>, u2s: &mut redb::Table<u32, &str>, counter: &mut u32) -> Result<u32> {
@@ -223,55 +271,77 @@ impl SchemaDb {
     where F: FnMut(&ArchivedSchemaNode)
     {
         let read_txn = self.db.begin_read()?;
+        let s2u_map = read_txn.open_table(STRING_TO_U32)?;
+        let card_table = read_txn.open_table(CARDINALITY_TABLE)?;
+
+        #[derive(Debug)]
+        enum QueryStep {
+            Type(String, u64),
+            Property(String, u64),
+            Keyword(String, u64),
+        }
+
+        let mut steps = Vec::new();
+
+        if let Some(ty) = &query.r#type {
+            let card = card_table.get((KIND_TYPE, ty.as_str()))?.map(|v| v.value()).unwrap_or(0);
+            steps.push(QueryStep::Type(ty.clone(), card));
+        }
+        if let Some(prop) = &query.property {
+            let card = card_table.get((KIND_PROP, prop.as_str()))?.map(|v| v.value()).unwrap_or(0);
+            steps.push(QueryStep::Property(prop.clone(), card));
+        }
+        if let Some(kw) = &query.keyword {
+            let card = card_table.get((KIND_FTS, kw.as_str()))?.map(|v| v.value()).unwrap_or(0);
+            steps.push(QueryStep::Keyword(kw.clone(), card));
+        }
+
+        steps.sort_by_key(|s| match s {
+            QueryStep::Type(_, c) | QueryStep::Property(_, c) | QueryStep::Keyword(_, c) => *c,
+        });
+
         let mut results: Option<HashSet<u64>> = None;
 
-        let s2u_map = read_txn.open_table(STRING_TO_U32)?;
-
-        if let Some(ty) = query.r#type {
-            if let Some(access) = s2u_map.get(ty.as_str())? {
-                let u32_ty = access.value();
-                let types_table = read_txn.open_table(TYPES_INDEX_TABLE)?;
-                let mut ids = HashSet::new();
-                for entry in types_table.range((u32_ty, 0)..(u32_ty, u64::MAX))? {
-                    ids.insert(entry?.0.value().1);
+        for step in steps {
+            let mut step_ids = HashSet::new();
+            match step {
+                QueryStep::Type(ty, _) => {
+                    if let Some(access) = s2u_map.get(ty.as_str())? {
+                        let u32_ty = access.value();
+                        let types_table = read_txn.open_table(TYPES_INDEX_TABLE)?;
+                        for entry in types_table.range((u32_ty, 0)..(u32_ty, u64::MAX))? {
+                            step_ids.insert(entry?.0.value().1);
+                        }
+                    } else { return Ok(()); }
                 }
-                results = Some(ids);
-            } else {
-                return Ok(());
-            }
-        }
-
-        if let Some(prop) = query.property {
-            if let Some(access) = s2u_map.get(prop.as_str())? {
-                let u32_prop = access.value();
-                let property_table = read_txn.open_table(PROPERTY_INDEX_TABLE)?;
-                let mut ids = HashSet::new();
-                for entry in property_table.range((u32_prop, 0)..(u32_prop, u64::MAX))? {
-                    ids.insert(entry?.0.value().1);
+                QueryStep::Property(prop, _) => {
+                    if let Some(access) = s2u_map.get(prop.as_str())? {
+                        let u32_prop = access.value();
+                        let property_table = read_txn.open_table(PROPERTY_INDEX_TABLE)?;
+                        for entry in property_table.range((u32_prop, 0)..(u32_prop, u64::MAX))? {
+                            step_ids.insert(entry?.0.value().1);
+                        }
+                    } else { return Ok(()); }
                 }
-                if let Some(mut current) = results {
-                    current.retain(|id| ids.contains(id));
-                    results = Some(current);
-                } else {
-                    results = Some(ids);
+                QueryStep::Keyword(kw, _) => {
+                    let fts_table = read_txn.open_table(FTS_INDEX_TABLE)?;
+                    let kw_lower = kw.to_lowercase();
+                    for entry in fts_table.range((kw_lower.as_str(), 0)..(kw_lower.as_str(), u64::MAX))? {
+                        step_ids.insert(entry?.0.value().1);
+                    }
+                    if step_ids.is_empty() { return Ok(()); }
                 }
-            } else {
-                return Ok(());
             }
-        }
 
-        if let Some(keyword) = query.keyword {
-            let fts_table = read_txn.open_table(FTS_INDEX_TABLE)?;
-            let mut ids = HashSet::new();
-            let kw = keyword.to_lowercase();
-            for entry in fts_table.range((kw.as_str(), 0)..(kw.as_str(), u64::MAX))? {
-                ids.insert(entry?.0.value().1);
-            }
             if let Some(mut current) = results {
-                current.retain(|id| ids.contains(id));
+                current.retain(|id| step_ids.contains(id));
                 results = Some(current);
             } else {
-                results = Some(ids);
+                results = Some(step_ids);
+            }
+
+            if let Some(ref r) = results {
+                if r.is_empty() { return Ok(()); }
             }
         }
 
@@ -281,6 +351,49 @@ impl SchemaDb {
                 if let Some(access) = nodes_table.get(id)? {
                     Self::with_validated_node(access.value(), |node| f(node))?;
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn bfs<F>(&self, start_id: &str, depth: usize, mut f: F) -> Result<()>
+    where F: FnMut(&ArchivedSchemaNode, usize)
+    {
+        let read_txn = self.db.begin_read()?;
+        let id_map = read_txn.open_table(ID_TO_U64)?;
+        let nodes_table = read_txn.open_table(NODES_TABLE)?;
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+
+        if let Some(access) = id_map.get(start_id)? {
+            let start_u64 = access.value();
+            queue.push_back((start_u64, 0));
+            visited.insert(start_u64);
+        }
+
+        while let Some((u64_id, current_depth)) = queue.pop_front() {
+            if current_depth > depth { continue; }
+
+            if let Some(access) = nodes_table.get(u64_id)? {
+                Self::with_validated_node(access.value(), |node| {
+                    f(node, current_depth);
+
+                    if current_depth < depth {
+                        for p in node.properties.iter() {
+                            for r in p.references.iter() {
+                                if let Ok(Some(target_access)) = id_map.get(r.as_str()) {
+                                    let target_u64 = target_access.value();
+                                    if !visited.contains(&target_u64) {
+                                        visited.insert(target_u64);
+                                        queue.push_back((target_u64, current_depth + 1));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })?;
             }
         }
 
@@ -563,6 +676,7 @@ impl SchemaDb {
             let mut numeric_table = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
             let mut fts_table = write_txn.open_table(FTS_INDEX_TABLE)?;
             let mut inbound_refs = write_txn.open_table(INBOUND_REFS_TABLE)?;
+            let mut card_table = write_txn.open_table(CARDINALITY_TABLE)?;
 
             let u64_id = {
                 let mut uid = None;
@@ -610,6 +724,7 @@ impl SchemaDb {
             for ty in types {
                 if let Some(access) = s2u_map.get(ty.as_str())? {
                     types_table.remove((access.value(), u64_id))?;
+                    Self::decrement_cardinality(&mut card_table, KIND_TYPE, ty.as_str())?;
                 }
             }
 
@@ -623,12 +738,15 @@ impl SchemaDb {
                 if let Some(access) = s2u_map.get(prop_name.as_str())? {
                     let pid = access.value();
                     property_table.remove((pid, u64_id))?;
+                    Self::decrement_cardinality(&mut card_table, KIND_PROP, prop_name.as_str())?;
+
                     for (v_owned, v_bytes) in vals {
                         value_table.remove((pid, v_bytes.as_slice(), u64_id))?;
 
                         if let SchemaValue::String(s) = &v_owned {
                             for token in Self::tokenize(s.as_str()) {
                                 fts_table.remove((token.as_str(), u64_id))?;
+                                Self::decrement_cardinality(&mut card_table, KIND_FTS, token.as_str())?;
                             }
                         }
 

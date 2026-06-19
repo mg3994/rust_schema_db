@@ -90,13 +90,12 @@ fn main() -> Result<()> {
     println!("Parallel conversion took: {:?}", start_conv.elapsed());
 
     println!("Generating synthetic data for scale test...");
-    let scale_factor = 30; // ~100k nodes total
+    let scale_factor = 20; // ~60k nodes total
     let mut all_nodes = real_nodes.clone();
     for i in 0..scale_factor {
         for node in &real_nodes {
             let mut new_node = node.clone();
             new_node.id = CompactString::new(format!("{}/synthetic/{}", node.id, i));
-            // Add a numeric property for range test
             new_node.properties.push(Property {
                 name: CompactString::new("syntheticScore"),
                 values: vec![SchemaValue::Integer(i as i64)],
@@ -113,17 +112,35 @@ fn main() -> Result<()> {
     println!("DB Ingestion took: {:?}", ingest_duration);
     println!("Ingestion rate: {:.2} nodes/sec", all_nodes.len() as f64 / ingest_duration.as_secs_f64());
 
-    let test_id = real_nodes.iter().find(|n| n.id.contains("Person")).map(|n| n.id.to_string()).unwrap_or_else(|| real_nodes[0].id.to_string());
+    let test_id = all_nodes.iter().find(|n| n.id.contains("Person")).map(|n| n.id.to_string()).unwrap_or_else(|| all_nodes[0].id.to_string());
 
     println!("Total nodes in DB: {}", db.count_nodes()?);
 
-    // Scaling verification
-    println!("\n--- Scale Verification ---");
-    let mut range_count = 0;
-    db.for_each_by_numeric_range("syntheticScore", 10, 15, |_| {
-        range_count += 1;
+    // Smart Query Verification
+    println!("\n--- Smart Query Optimizer Verification ---");
+    let query = Query {
+        r#type: Some("rdfs:Class".to_string()),
+        property: Some("rdfs:label".to_string()),
+        keyword: Some("Person".to_string()),
+    };
+    let mut search_count = 0;
+    let start_search = Instant::now();
+    db.search(query, |node| {
+        search_count += 1;
+        std::hint::black_box(&node.id);
     })?;
-    println!("Found {} synthetic nodes in range [10, 15]", range_count);
+    println!("Found {} matches via optimized intersection in {:?}", search_count, start_search.elapsed());
+
+    // BFS Verification
+    println!("\n--- Graph BFS Traversal Verification ---");
+    let mut bfs_nodes = 0;
+    db.bfs("http://www.w3.org/2000/01/rdf-schema#Class", 2, |node, depth| {
+        bfs_nodes += 1;
+        if bfs_nodes < 5 {
+             println!("Level {}: Found {}", depth, node.id);
+        }
+    })?;
+    println!("Traversed {} unique nodes starting from 'rdfs:Class' up to depth 2", bfs_nodes);
 
     // Multi-threaded Read Benchmark
     println!("\n--- Multi-threaded Read Benchmark ---");
@@ -137,8 +154,7 @@ fn main() -> Result<()> {
         }
     });
     let duration_multi = start_multi.elapsed();
-    println!("Multi-threaded read ({} threads, {} total iters): {:?}", rayon::current_num_threads(), rayon::current_num_threads() * thread_iters, duration_multi);
-    println!("Average throughput: {:.2} reads/sec", (rayon::current_num_threads() * thread_iters) as f64 / duration_multi.as_secs_f64());
+    println!("Multi-threaded throughput: {:.2} reads/sec", (rayon::current_num_threads() * thread_iters) as f64 / duration_multi.as_secs_f64());
 
     // Single-threaded rkyv zero-copy read benchmark
     println!("\n--- Final Zero-Copy Benchmark ID: {} ---", test_id);
@@ -153,8 +169,7 @@ fn main() -> Result<()> {
         duration_pure_access = start.elapsed();
         Ok::<(), anyhow::Error>(())
     })?.unwrap();
-    println!("Pure zero-copy access ({} iters): {:?}", iters, duration_pure_access);
-    println!("Average pure access latency: {:?}", duration_pure_access / iters);
+    println!("Pure zero-copy access latency: {:?}", duration_pure_access / iters);
 
     // Compare with serde_json
     let json_node = serde_json::json!({
@@ -170,8 +185,6 @@ fn main() -> Result<()> {
         std::hint::black_box(val.get("@id").and_then(|v| v.as_str()));
     }
     let duration_serde = start.elapsed();
-    println!("serde_json parse ({} iters): {:?}", iters, duration_serde);
-    println!("Average serde_json latency: {:?}", duration_serde / iters);
     println!("Speedup (Pure Access vs Serde): {:.2}x", duration_serde.as_secs_f64() / duration_pure_access.as_secs_f64());
 
     Ok(())
