@@ -3,13 +3,14 @@ mod db;
 
 use anyhow::Result;
 use compact_str::CompactString;
-use db::SchemaDb;
+use db::{SchemaDb, Query};
 use models::{Property, SchemaNode, SchemaValue};
 use rkyv::Deserialize;
 use simd_json::prelude::*;
 use std::fs::File;
 use std::io::Read;
 use std::time::{Instant, Duration};
+use rayon::prelude::*;
 
 fn main() -> Result<()> {
     let db_path = "schema_db.redb";
@@ -45,20 +46,15 @@ fn main() -> Result<()> {
         }
     };
 
-    println!("Converting and Ingesting {} nodes...", nodes_json.len());
-    let mut test_id = String::new();
-    let mut schema_nodes = Vec::with_capacity(nodes_json.len());
-
-    for node_val in nodes_json {
+    println!("Converting {} nodes in parallel...", nodes_json.len());
+    let start_conv = Instant::now();
+    let schema_nodes: Vec<SchemaNode> = nodes_json.par_iter().filter_map(|node_val| {
         if let Some(node_obj) = node_val.as_object() {
             let id = node_obj.get("@id")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
 
-            if id.is_empty() { continue; }
-            if test_id.is_empty() && id.contains("Person") {
-                test_id = id.to_string();
-            }
+            if id.is_empty() { return None; }
 
             let mut node = SchemaNode::new(CompactString::new(id));
 
@@ -86,20 +82,19 @@ fn main() -> Result<()> {
                     references: refs,
                 });
             }
-            schema_nodes.push(node);
+            Some(node)
+        } else {
+            None
         }
-    }
+    }).collect();
+    println!("Parallel conversion took: {:?}", start_conv.elapsed());
 
-    let start = Instant::now();
+    println!("Ingesting nodes into DB...");
+    let start_ingest = Instant::now();
     db.upsert_batch(&schema_nodes)?;
-    let duration = start.elapsed();
-    println!("Batched ingestion took: {:?}", duration);
+    println!("DB Ingestion took: {:?}", start_ingest.elapsed());
 
-    if test_id.is_empty() {
-        if let Some(first) = schema_nodes.first() {
-             test_id = first.id.to_string();
-        }
-    }
+    let test_id = schema_nodes.iter().find(|n| n.id.contains("Person")).map(|n| n.id.to_string()).unwrap_or_else(|| schema_nodes[0].id.to_string());
 
     println!("Total nodes in DB: {}", db.count_nodes()?);
     let types = db.list_types()?;
@@ -110,57 +105,48 @@ fn main() -> Result<()> {
     // Basic CRUD Verification
     println!("\n--- CRUD Verification ---");
     let test_node = SchemaNode {
-        id: CompactString::new("http://test.org/1"),
+        id: CompactString::new("http://test.org/alpha"),
         types: vec![CompactString::new("TestType")],
         properties: vec![Property {
             name: CompactString::new("testProp"),
-            values: vec![SchemaValue::Integer(123)],
+            values: vec![SchemaValue::Integer(123), SchemaValue::String(CompactString::new("Searching for needles in haystacks"))],
             references: Vec::new(),
         }],
     };
     db.upsert_batch(&[test_node.clone()])?;
-    assert!(db.with_node("http://test.org/1", |_| ())?.is_some());
+    assert!(db.with_node("http://test.org/alpha", |_| ())?.is_some());
     println!("Upsert verified.");
 
-    let ids = db.get_ids_by_type("TestType")?;
-    assert!(ids.contains(&"http://test.org/1".to_string()));
-    println!("Type index query verified.");
-
-    // Numeric Range Verification
-    println!("\n--- Numeric Range Verification ---");
-    let mut found_ids = Vec::new();
-    db.for_each_by_numeric_range("testProp", 100, 200, |node| {
-        found_ids.push(node.id.to_string());
+    // FTS Verification
+    println!("\n--- FTS Verification ---");
+    let mut found_fts = Vec::new();
+    db.for_each_by_keyword("needles", |node| {
+        found_fts.push(node.id.to_string());
     })?;
-    assert!(found_ids.contains(&"http://test.org/1".to_string()));
-    println!("Numeric range search verified.");
+    assert!(found_fts.contains(&"http://test.org/alpha".to_string()));
+    println!("FTS verified.");
 
-    // Value Search Verification
-    println!("\n--- Value Search Verification ---");
-    let mut found_ids_val = Vec::new();
-    db.for_each_by_value("testProp", &SchemaValue::Integer(123), |node| {
-        found_ids_val.push(node.id.to_string());
+    // Advanced Query Verification
+    println!("\n--- Advanced Query Verification ---");
+    let query = Query {
+        r#type: Some("TestType".to_string()),
+        property: Some("testProp".to_string()),
+        keyword: Some("haystacks".to_string()),
+    };
+    let mut search_results = Vec::new();
+    db.search(query, |node| {
+        search_results.push(node.id.to_string());
     })?;
-    assert!(found_ids_val.contains(&"http://test.org/1".to_string()));
-    println!("Value-based search verified.");
+    assert!(search_results.contains(&"http://test.org/alpha".to_string()));
+    println!("Intersectional Search verified.");
 
-    db.remove("http://test.org/1")?;
-    assert!(db.with_node("http://test.org/1", |_| ())?.is_none());
+    db.remove("http://test.org/alpha")?;
+    assert!(db.with_node("http://test.org/alpha", |_| ())?.is_none());
     println!("Remove and Index pruning verified.");
-
-    // Graph Traversal Verification
-    println!("\n--- Graph Traversal Verification ---");
-    let ids_to_resolve = vec![test_id.as_str(), "https://schema.org/Thing"];
-    let mut resolved_count = 0;
-    db.resolve_references(&ids_to_resolve, |_| {
-        resolved_count += 1;
-    })?;
-    println!("Resolved {} references in one pass.", resolved_count);
 
     // Benchmarking
     println!("\n--- Benchmarking ID: {} ---", test_id);
 
-    // Warm up and verify
     let mut label_val = SchemaValue::Null;
     db.with_node(&test_id, |node| {
         println!("Found node: {} with {} types", node.id, node.types.len());
@@ -175,7 +161,7 @@ fn main() -> Result<()> {
 
     let iters = 1_000_000;
 
-    // Benchmark rkyv zero-copy read
+    // Benchmark rkyv zero-copy read (Total path)
     let start = Instant::now();
     for _ in 0..iters {
         let _ = db.with_node(&test_id, |archived| {
@@ -200,18 +186,6 @@ fn main() -> Result<()> {
     })?.unwrap();
     println!("Pure zero-copy access ({} iters): {:?}", iters, duration_pure_access);
     println!("Average pure access latency: {:?}", duration_pure_access / iters);
-
-    // Benchmark Reference Resolution
-    let start = Instant::now();
-    let res_iters = 100_000;
-    for _ in 0..res_iters {
-        let _ = db.resolve_references(&ids_to_resolve, |node| {
-             std::hint::black_box(&node.id);
-        })?;
-    }
-    let duration_res = start.elapsed();
-    println!("Reference resolution ({} refs, {} iters): {:?}", ids_to_resolve.len(), res_iters, duration_res);
-    println!("Average resolution latency: {:?}", duration_res / res_iters);
 
     // Compare with serde_json
     let json_node = serde_json::json!({

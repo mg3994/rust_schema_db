@@ -8,6 +8,7 @@ use rkyv::{
 };
 use std::path::Path;
 use crate::models::{SchemaNode, ArchivedSchemaNode, SchemaValue};
+use std::collections::HashSet;
 
 const NODES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes_v2");
 const ID_TO_U64: TableDefinition<&str, u64> = TableDefinition::new("id_to_u64");
@@ -18,10 +19,18 @@ const TYPES_INDEX_TABLE: TableDefinition<(u32, u64), ()> = TableDefinition::new(
 const PROPERTY_INDEX_TABLE: TableDefinition<(u32, u64), ()> = TableDefinition::new("property_index_v3");
 const VALUE_INDEX_TABLE: TableDefinition<(u32, &[u8], u64), ()> = TableDefinition::new("value_index");
 const NUMERIC_INDEX_TABLE: TableDefinition<(u32, i64, u64), ()> = TableDefinition::new("numeric_index_v2");
+const FTS_INDEX_TABLE: TableDefinition<(&str, u64), ()> = TableDefinition::new("fts_index");
 const COUNTER_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counter");
 
 pub struct SchemaDb {
     db: Database,
+}
+
+#[derive(Default)]
+pub struct Query {
+    pub r#type: Option<String>,
+    pub property: Option<String>,
+    pub keyword: Option<String>,
 }
 
 impl SchemaDb {
@@ -39,11 +48,20 @@ impl SchemaDb {
             let _ = write_txn.open_table(PROPERTY_INDEX_TABLE)?;
             let _ = write_txn.open_table(VALUE_INDEX_TABLE)?;
             let _ = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
+            let _ = write_txn.open_table(FTS_INDEX_TABLE)?;
             let _ = write_txn.open_table(COUNTER_TABLE)?;
         }
         write_txn.commit()?;
 
         Ok(Self { db })
+    }
+
+    fn tokenize(text: &str) -> Vec<String> {
+        text.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| s.len() > 2)
+            .map(|s| s.to_string())
+            .collect()
     }
 
     pub fn upsert_batch(&self, nodes: &[SchemaNode]) -> Result<()> {
@@ -58,6 +76,7 @@ impl SchemaDb {
             let mut property_table = write_txn.open_table(PROPERTY_INDEX_TABLE)?;
             let mut value_table = write_txn.open_table(VALUE_INDEX_TABLE)?;
             let mut numeric_table = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
+            let mut fts_table = write_txn.open_table(FTS_INDEX_TABLE)?;
             let mut counter_table = write_txn.open_table(COUNTER_TABLE)?;
 
             let mut current_id_counter = counter_table.get("id_counter")?.map(|v| v.value()).unwrap_or(0);
@@ -65,11 +84,11 @@ impl SchemaDb {
 
             for node in nodes {
                 let u64_id = {
-                    let mut id = None;
+                    let mut existing_id = None;
                     if let Some(access) = id_map.get(node.id.as_str())? {
-                        id = Some(access.value());
+                        existing_id = Some(access.value());
                     }
-                    if let Some(v) = id {
+                    if let Some(v) = existing_id {
                         v
                     } else {
                         current_id_counter += 1;
@@ -95,14 +114,18 @@ impl SchemaDb {
                     property_table.insert((u32_prop, u64_id), ())?;
 
                     for val in &prop.values {
-                        // Value Index (Exact)
+                        if let SchemaValue::String(s) = val {
+                            for token in Self::tokenize(s.as_str()) {
+                                fts_table.insert((token.as_str(), u64_id), ())?;
+                            }
+                        }
+
                         let mut val_serializer = AllocSerializer::<256>::default();
                         val_serializer.serialize_value(val)
                             .map_err(|e| anyhow::anyhow!("Value serialization failed: {}", e))?;
                         let val_bytes = val_serializer.into_serializer().into_inner();
                         value_table.insert((u32_prop, val_bytes.as_slice(), u64_id), ())?;
 
-                        // Numeric Index (Range)
                         match val {
                             SchemaValue::Integer(i) => {
                                 numeric_table.insert((u32_prop, *i, u64_id), ())?;
@@ -171,6 +194,108 @@ impl SchemaDb {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn search<F>(&self, query: Query, mut f: F) -> Result<()>
+    where F: FnMut(&ArchivedSchemaNode)
+    {
+        let read_txn = self.db.begin_read()?;
+        let mut results: Option<HashSet<u64>> = None;
+
+        let s2u_map = read_txn.open_table(STRING_TO_U32)?;
+
+        // Intersect Type results
+        if let Some(ty) = query.r#type {
+            if let Some(access) = s2u_map.get(ty.as_str())? {
+                let u32_ty = access.value();
+                let types_table = read_txn.open_table(TYPES_INDEX_TABLE)?;
+                let mut ids = HashSet::new();
+                for entry in types_table.range((u32_ty, 0)..(u32_ty, u64::MAX))? {
+                    ids.insert(entry?.0.value().1);
+                }
+                results = Some(ids);
+            } else {
+                return Ok(()); // Type not found
+            }
+        }
+
+        // Intersect Property results
+        if let Some(prop) = query.property {
+            if let Some(access) = s2u_map.get(prop.as_str())? {
+                let u32_prop = access.value();
+                let property_table = read_txn.open_table(PROPERTY_INDEX_TABLE)?;
+                let mut ids = HashSet::new();
+                for entry in property_table.range((u32_prop, 0)..(u32_prop, u64::MAX))? {
+                    ids.insert(entry?.0.value().1);
+                }
+                if let Some(mut current) = results {
+                    current.retain(|id| ids.contains(id));
+                    results = Some(current);
+                } else {
+                    results = Some(ids);
+                }
+            } else {
+                return Ok(());
+            }
+        }
+
+        // Intersect Keyword results
+        if let Some(keyword) = query.keyword {
+            let fts_table = read_txn.open_table(FTS_INDEX_TABLE)?;
+            let mut ids = HashSet::new();
+            let kw = keyword.to_lowercase();
+            for entry in fts_table.range((kw.as_str(), 0)..(kw.as_str(), u64::MAX))? {
+                ids.insert(entry?.0.value().1);
+            }
+            if let Some(mut current) = results {
+                current.retain(|id| ids.contains(id));
+                results = Some(current);
+            } else {
+                results = Some(ids);
+            }
+        }
+
+        if let Some(ids) = results {
+            let nodes_table = read_txn.open_table(NODES_TABLE)?;
+            for id in ids {
+                if let Some(access) = nodes_table.get(id)? {
+                    Self::with_validated_node(access.value(), |node| f(node))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn get_ids_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let read_txn = self.db.begin_read()?;
+        let id_map = read_txn.open_table(ID_TO_U64)?;
+        let mut ids = Vec::new();
+        let end = format!("{}\u{10FFFF}", prefix);
+        for entry in id_map.range(prefix..=end.as_str())? {
+            let (key, _) = entry?;
+            ids.push(key.value().to_string());
+        }
+        Ok(ids)
+    }
+
+    pub fn for_each_by_keyword<F>(&self, keyword: &str, mut f: F) -> Result<()>
+    where F: FnMut(&ArchivedSchemaNode)
+    {
+        let read_txn = self.db.begin_read()?;
+        let fts_table = read_txn.open_table(FTS_INDEX_TABLE)?;
+        let nodes_table = read_txn.open_table(NODES_TABLE)?;
+
+        let keyword = keyword.to_lowercase();
+        let range = (keyword.as_str(), 0)..(keyword.as_str(), u64::MAX);
+        for entry in fts_table.range(range)? {
+            let (key, _) = entry?;
+            let (_, u64_id) = key.value();
+            if let Some(access) = nodes_table.get(u64_id)? {
+                Self::with_validated_node(access.value(), |node| f(node))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn for_each_by_value<F>(&self, prop_name: &str, value: &SchemaValue, mut f: F) -> Result<()>
@@ -393,6 +518,7 @@ impl SchemaDb {
             let mut property_table = write_txn.open_table(PROPERTY_INDEX_TABLE)?;
             let mut value_table = write_txn.open_table(VALUE_INDEX_TABLE)?;
             let mut numeric_table = write_txn.open_table(NUMERIC_INDEX_TABLE)?;
+            let mut fts_table = write_txn.open_table(FTS_INDEX_TABLE)?;
 
             let u64_id = {
                 let mut uid = None;
@@ -445,6 +571,13 @@ impl SchemaDb {
                     property_table.remove((pid, u64_id))?;
                     for (v_owned, v_bytes) in vals {
                         value_table.remove((pid, v_bytes.as_slice(), u64_id))?;
+
+                        if let SchemaValue::String(s) = &v_owned {
+                            for token in Self::tokenize(s.as_str()) {
+                                fts_table.remove((token.as_str(), u64_id))?;
+                            }
+                        }
+
                         match v_owned {
                             SchemaValue::Integer(i) => {
                                 numeric_table.remove((pid, i, u64_id))?;
